@@ -1,0 +1,31 @@
+name: Build Android APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Generate Flutter Android scaffold
+        run: |
+          mkdir -p /tmp/ftms_overlay
+          cp -R lib pubspec.yaml android .github /tmp/ftms_overlay/
+          flutter create --platforms=android --org com.example --project-name virtual_ftms_bike .
+          cp -R /tmp/ftms_overlay/lib/. lib/
+          cp /tmp/ftms_overlay/pubspec.yaml pubspec.yaml
+          cp /tmp/ftms_overlay/android/app/src/main/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+          mkdir -p android/app/src/main/kotlin/com/example/virtual_ftms_bike
+          cp /tmp/ftms_overlay/android/app/src/main/kotlin/com/example/virtual_ftms_bike/MainActivity.kt android/app/src/main/kotlin/com/example/virtual_ftms_bike/MainActivity.kt
+          flutter pub get
+      - name: Build APK
+        run: flutter build apk --debug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: virtual-ftms-bike-debug-apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
