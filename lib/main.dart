@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'dart:async';
 
 void main() => runApp(const VirtualBikeApp());
 
@@ -23,6 +24,22 @@ class BikeHome extends StatefulWidget {
 class _BikeHomeState extends State<BikeHome> {
   static const channel = MethodChannel('virtual_ftms_bike/ble');
   bool running = false;
+  List<String> bleLogs = [];
+  Timer? logTimer;
+  @override
+  void initState() {
+    super.initState();
+    logTimer = Timer.periodic(const Duration(seconds: 1), (_) => refreshLogs());
+  }
+  Future<void> refreshLogs() async {
+    try {
+      final lines = await channel.invokeListMethod<String>('logs');
+      if (mounted && lines != null) setState(() => bleLogs = lines);
+    } catch (_) {}
+  }
+  @override
+  void dispose() { logTimer?.cancel(); super.dispose(); }
+
   String status = 'Parado';
   double speed = 20;
   double cadence = 60;
@@ -85,6 +102,15 @@ class _BikeHomeState extends State<BikeHome> {
       FilledButton.icon(onPressed: toggle,
         icon: Icon(running ? Icons.stop : Icons.bluetooth),
         label: Text(running ? 'Parar bicicleta virtual' : 'Iniciar bicicleta virtual')),
+      const SizedBox(height: 18),
+      Row(children: [
+        const Expanded(child: Text('Diagnóstico Bluetooth', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold))),
+        TextButton(onPressed: () async { await channel.invokeMethod('clearLogs'); await refreshLogs(); }, child: const Text('Limpar')),
+        TextButton(onPressed: () { Clipboard.setData(ClipboardData(text: bleLogs.join('\n'))); ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Registos copiados'))); }, child: const Text('Copiar')),
+      ]),
+      Container(height: 230, padding: const EdgeInsets.all(10), color: Colors.black54,
+        child: ListView(children: [SelectableText(bleLogs.isEmpty ? 'Sem eventos ainda' : bleLogs.join('\n'),
+          style: const TextStyle(fontSize: 11, fontFamily: 'monospace'))])),
       const SizedBox(height: 20),
       const Text('No tablet, procura «Virtual FTMS Bike» no Incyclist. '
           'Mantém esta aplicação aberta durante o teste. '
