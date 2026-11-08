@@ -11,6 +11,9 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.util.UUID
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : FlutterActivity() {
     private val channelName = "virtual_ftms_bike/ble"
@@ -22,6 +25,15 @@ class MainActivity : FlutterActivity() {
     private val machineStatus = uuid("2AD3")
     private val cccd = uuid("2902")
     private val handler = Handler(Looper.getMainLooper())
+    private val logLines = ArrayDeque<String>()
+    private fun log(message: String) {
+        synchronized(logLines) {
+            logLines.addLast("${SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(Date())}  $message")
+            while (logLines.size > 250) logLines.removeFirst()
+        }
+        android.util.Log.i("VirtualFTMS", message)
+    }
+    private fun logs(): List<String> = synchronized(logLines) { logLines.toList() }
     private var server: BluetoothGattServer? = null
     private var advertiser: BluetoothLeAdvertiser? = null
     private var advertisingCallback: AdvertiseCallback? = null
@@ -56,6 +68,8 @@ class MainActivity : FlutterActivity() {
                     try { start(result) } catch (e: Exception) { result.error("BLE", e.message, null) }
                 }
                 "stop" -> { stop(); result.success(null) }
+                "logs" -> result.success(logs())
+                "clearLogs" -> { synchronized(logLines) { logLines.clear() }; result.success(null) }
                 "update" -> {
                     speed = (call.argument<Number>("speed") ?: 20).toDouble()
                     cadence = (call.argument<Number>("cadence") ?: 60).toDouble()
@@ -75,6 +89,7 @@ class MainActivity : FlutterActivity() {
             return
         }
         stop()
+        log("START requested")
         val manager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
         val adapter = manager.adapter
         if (adapter == null || !adapter.isEnabled) { result.error("BLUETOOTH", "Ativa o Bluetooth.", null); return }
@@ -94,24 +109,38 @@ class MainActivity : FlutterActivity() {
         service.addCharacteristic(statusCharacteristic)
         service.addCharacteristic(characteristic(machineStatus, BluetoothGattCharacteristic.PROPERTY_READ).apply { value = byteArrayOf(0x02) })
         if (!server!!.addService(service)) { stop(); result.error("GATT", "Falha ao adicionar serviço FTMS.", null); return }
-        val settings = AdvertiseSettings.Builder().setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH).setConnectable(true).build()
-        val data = AdvertiseData.Builder().addServiceUuid(android.os.ParcelUuid(ftms)).setIncludeDeviceName(false).build()
-        val scan = AdvertiseData.Builder().setIncludeDeviceName(false).addManufacturerData(0xFFFF, byteArrayOf(0x01)).build()
-        // Android's BLE advertising payload has a strict 31-byte legacy limit.
-        advertisingCallback = object : AdvertiseCallback() {
-            override fun onStartSuccess(settingsInEffect: AdvertiseSettings) { running = true }
-            override fun onStartFailure(errorCode: Int) { running = false; stop() }
-        }
-        // Device name is set for the local adapter, so scanners may see it in the scan response.
-        try { adapter.name = "Virtual FTMS Bike" } catch (_: Exception) { }
-        advertiser!!.startAdvertising(settings, data,
-            AdvertiseData.Builder().setIncludeDeviceName(true).build(), advertisingCallback!!)
-        running = true
+        log("GATT addService requested")
         startedAt = System.currentTimeMillis()
         elapsedBefore = 0
-        handler.post(tick)
-        result.success("A anunciar Virtual FTMS Bike")
+        result.success("A preparar serviço FTMS")
+    }
+
+    private fun beginAdvertising() {
+        val manager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
+        val adapter = manager.adapter ?: return
+        val adv = advertiser ?: return
+        val settings = AdvertiseSettings.Builder()
+            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH).setConnectable(true).build()
+        val data = AdvertiseData.Builder().addServiceUuid(android.os.ParcelUuid(ftms)).build()
+        val scan = AdvertiseData.Builder().setIncludeDeviceName(true).build()
+        try { adapter.name = "Virtual FTMS Bike" } catch (e: Exception) { log("Name: ${e.message}") }
+        advertisingCallback = object : AdvertiseCallback() {
+            override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
+                log("ADVERTISING started")
+                running = true
+                handler.removeCallbacks(tick)
+                handler.post(tick)
+            }
+            override fun onStartFailure(errorCode: Int) {
+                log("ADVERTISING FAILED code=$errorCode")
+                running = false
+            }
+        }
+        try {
+            adv.startAdvertising(settings, data, scan, advertisingCallback!!)
+            log("ADVERTISING requested")
+        } catch (e: Exception) { log("ADVERTISING exception ${e.message}") }
     }
 
     private val tick = object : Runnable {
@@ -152,11 +181,20 @@ class MainActivity : FlutterActivity() {
     }
 
     private val callback = object : BluetoothGattServerCallback() {
+        override fun onServiceAdded(status: Int, service: BluetoothGattService) {
+            log("SERVICE ADDED status=$status uuid=${service.uuid}")
+            if (status == BluetoothGatt.GATT_SUCCESS) handler.post { beginAdvertising() }
+        }
+        override fun onNotificationSent(device: BluetoothDevice, status: Int) {
+            if (status != BluetoothGatt.GATT_SUCCESS) log("NOTIFY ERROR ${device.address} status=$status")
+        }
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
+            log("CONNECTION ${device.address} status=$status state=$newState")
             if (newState == BluetoothProfile.STATE_CONNECTED) devices[device.address] = device
-            else { devices.remove(device.address); subscribers.remove(device.address) }
+            else { devices.remove(device.address); subscribers.remove(device.address); log("DISCONNECTED; advertising remains active") }
         }
         override fun onCharacteristicReadRequest(device: BluetoothDevice, requestId: Int, offset: Int, c: BluetoothGattCharacteristic) {
+            log("READ ${device.address} characteristic=${c.uuid} offset=$offset")
             val value = when (c.uuid) {
                 feature -> byteArrayOf(0x02, 0x40, 0, 0, 0, 0, 0, 0)
                 machineStatus -> byteArrayOf(0x02)
@@ -166,6 +204,7 @@ class MainActivity : FlutterActivity() {
             else server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value.copyOfRange(offset, value.size))
         }
         override fun onDescriptorReadRequest(device: BluetoothDevice, requestId: Int, offset: Int, d: BluetoothGattDescriptor) {
+            log("DESCRIPTOR READ ${device.address} char=${d.characteristic.uuid}")
             val active = subscribers[device.address]?.contains(d.characteristic.uuid) == true
             val value = if (!active) byteArrayOf(0, 0) else if (d.characteristic.uuid == control) byteArrayOf(2, 0) else byteArrayOf(1, 0)
             if (offset > value.size) server?.sendResponse(device, requestId, BluetoothGatt.GATT_INVALID_OFFSET, offset, null)
@@ -175,6 +214,7 @@ class MainActivity : FlutterActivity() {
                                                preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray) {
             val ok = !preparedWrite && offset == 0 && value.size == 2 && (value.contentEquals(byteArrayOf(0,0)) ||
                 value.contentEquals(byteArrayOf(1,0)) || value.contentEquals(byteArrayOf(2,0)))
+            log("DESCRIPTOR WRITE ${device.address} char=${d.characteristic.uuid} value=${value.joinToString("") { "%02X".format(it.toInt() and 255) }} ok=$ok")
             if (ok) {
                 val set = subscribers.getOrPut(device.address) { mutableSetOf() }
                 if (value[0].toInt() == 0) set.remove(d.characteristic.uuid) else set.add(d.characteristic.uuid)
@@ -183,6 +223,7 @@ class MainActivity : FlutterActivity() {
         }
         override fun onCharacteristicWriteRequest(device: BluetoothDevice, requestId: Int, c: BluetoothGattCharacteristic,
                                                   preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray) {
+            log("CHAR WRITE ${device.address} char=${c.uuid} bytes=${value.joinToString("") { "%02X".format(it.toInt() and 255) }}")
             val valid = c.uuid == control && !preparedWrite && offset == 0 && value.isNotEmpty()
             if (responseNeeded) server?.sendResponse(device, requestId, if (valid) BluetoothGatt.GATT_SUCCESS else BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, offset, null)
             if (valid) {
@@ -191,6 +232,7 @@ class MainActivity : FlutterActivity() {
                 val supported = op == 0x00 || op == 0x07 || op == 0x08
                 if (op == 0x07) { startedAt = System.currentTimeMillis(); elapsedBefore = 0 }
                 val response = byteArrayOf(0x80.toByte(), op.toByte(), if (supported) 0x01 else 0x02)
+                log("CONTROL op=$op supported=$supported response=${response.joinToString("") { "%02X".format(it.toInt() and 255) }}")
                 // Schedule after ATT write response, for clients requiring that ordering.
                 handler.postDelayed({ controlCharacteristic?.let { notifyAll(it, response, true) } }, 100)
             }
@@ -198,6 +240,7 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun stop() {
+        log("STOP requested")
         running = false
         handler.removeCallbacks(tick)
         try { advertisingCallback?.let { advertiser?.stopAdvertising(it) } } catch (_: Exception) { }
